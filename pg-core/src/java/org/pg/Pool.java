@@ -259,6 +259,19 @@ public final class Pool implements AutoCloseable {
             return;
         }
 
+        // Check for protocol desync: unread data means the connection is corrupted.
+        // Discard it rather than poisoning the next borrower.
+        if (conn.hasUnreadData()) {
+            logger.log(System.Logger.Level.WARNING,
+                "Connection {0} has unread data in input stream, closing (pool {1})",
+                conn.getId(), id);
+            closeConnection(conn);
+            try (TryLock ignored = lock.get()) {
+                removeUsed(conn);
+            }
+            return;
+        }
+
         // else
         try (TryLock ignored = lock.get()) {
             removeUsed(conn);

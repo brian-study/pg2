@@ -257,6 +257,12 @@ public final class Connection implements AutoCloseable {
                 if (Debug.isON) {
                     Debug.debug(" -> skipping message: %s", msg);
                 }
+            } else if (msg instanceof NoticeResponse nr) {
+                handleNoticeResponse(nr);
+            } else if (msg instanceof ParameterStatus ps) {
+                handleParameterStatus(ps);
+            } else if (msg instanceof NotificationResponse notif) {
+                handleNotificationResponse(notif);
             } else if (msg instanceof ReadyForQuery) {
                 break;
             } else if (msg instanceof ErrorResponse e) {
@@ -732,7 +738,16 @@ public final class Connection implements AutoCloseable {
                            final ExecuteParams executeParams
     ) {
         final List<Object> params = executeParams.params();
-        final int[] OIDs = stmt.parameterDescription().oids();
+        final ParameterDescription pd = stmt.parameterDescription();
+        if (pd == null) {
+            throw new PGError(
+                "ParameterDescription is null for statement '%s' (SQL: %s). " +
+                "This indicates a protocol desync — the connection may be corrupted.",
+                stmt.parse().statement(),
+                stmt.parse().query()
+            );
+        }
+        final int[] OIDs = pd.oids();
         final int size = params.size();
 
         if (size != OIDs.length) {
@@ -1275,10 +1290,7 @@ public final class Connection implements AutoCloseable {
         config.executor().execute(() -> f.invoke(arg));
     }
 
-    private void handleNotificationResponse (final NotificationResponse msg, final Result res) {
-        res.incNotificationCount();
-        // Sometimes, it's important to know whether a notification
-        // was triggered by the current connection or another.
+    private void handleNotificationResponse (final NotificationResponse msg) {
         final boolean isSelf = msg.pid() == pid;
         final Object obj = msg.toClojure().assoc(KW.self_QMARK, isSelf);
         final IFn handler = config.fnNotification();
@@ -1287,6 +1299,11 @@ public final class Connection implements AutoCloseable {
         } else {
             handlerCall(handler, obj);
         }
+    }
+
+    private void handleNotificationResponse (final NotificationResponse msg, final Result res) {
+        res.incNotificationCount();
+        handleNotificationResponse(msg);
     }
 
     private void handleNoticeResponse (final NoticeResponse msg) {
@@ -1509,6 +1526,19 @@ public final class Connection implements AutoCloseable {
     public boolean isIdle () {
         try (final TryLock ignored = lock.get()) {
             return txStatus == TXStatus.IDLE;
+        }
+    }
+
+    /**
+     * Check if the connection's input stream has unread data.
+     * Unread data after a complete operation indicates protocol desync.
+     * Used by Pool to detect corrupted connections before returning them.
+     */
+    public boolean hasUnreadData () {
+        try {
+            return inStream != null && inStream.available() > 0;
+        } catch (IOException e) {
+            return true;
         }
     }
 
