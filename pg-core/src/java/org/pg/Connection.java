@@ -702,7 +702,17 @@ public final class Connection implements AutoCloseable {
                            final ExecuteParams executeParams
     ) {
         final List<Object> params = executeParams.params();
-        final int[] OIDs = stmt.parameterDescription().oids();
+        final ParameterDescription pd = stmt.parameterDescription();
+        if (pd == null) {
+            throw new PGError(
+                    "Protocol desync: parameterDescription is null in sendBind. " +
+                    "The server did not send a ParameterDescription during prepare. " +
+                    "This may indicate a corrupted connection or that an earlier query " +
+                    "left unread data in the input stream. SQL: %s, params: %s",
+                    stmt.parse().query(), params
+            );
+        }
+        final int[] OIDs = pd.oids();
         final int size = params.size();
 
         if (size != OIDs.length) {
@@ -1541,6 +1551,11 @@ public final class Connection implements AutoCloseable {
             final String payload = JSON.writeValueToString(config.objectMapper(), data);
             notify(channel, payload);
         }
+    }
+
+    @SuppressWarnings("unused")
+    public boolean hasUnreadData() {
+        return IOTool.available(inStream) > 0;
     }
 
     @SuppressWarnings("unused")
