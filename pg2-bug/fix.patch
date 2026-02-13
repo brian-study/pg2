@@ -1,0 +1,161 @@
+diff --git a/pg-core/src/java/org/pg/Connection.java b/pg-core/src/java/org/pg/Connection.java
+index 520d138..3cb4928 100644
+--- a/pg-core/src/java/org/pg/Connection.java
++++ b/pg-core/src/java/org/pg/Connection.java
+@@ -702,7 +702,17 @@ public final class Connection implements AutoCloseable {
+                            final ExecuteParams executeParams
+     ) {
+         final List<Object> params = executeParams.params();
+-        final int[] OIDs = stmt.parameterDescription().oids();
++        final ParameterDescription pd = stmt.parameterDescription();
++        if (pd == null) {
++            throw new PGError(
++                    "Protocol desync: parameterDescription is null in sendBind. " +
++                    "The server did not send a ParameterDescription during prepare. " +
++                    "This may indicate a corrupted connection or that an earlier query " +
++                    "left unread data in the input stream. SQL: %s, params: %s",
++                    stmt.parse().query(), params
++            );
++        }
++        final int[] OIDs = pd.oids();
+         final int size = params.size();
+ 
+         if (size != OIDs.length) {
+@@ -1543,6 +1553,47 @@ public final class Connection implements AutoCloseable {
+         }
+     }
+ 
++    @SuppressWarnings("unused")
++    public boolean hasUnreadData() {
++        return IOTool.available(inStream) > 0;
++    }
++
++    /**
++     * Drain any pending asynchronous messages from the input stream.
++     * PostgreSQL can send NoticeResponse, ParameterStatus, and
++     * NotificationResponse at any time, even when no query is active.
++     * These may accumulate in the TCP buffer while a connection sits
++     * idle in the pool.
++     *
++     * This method reads and handles those async messages. If a non-async
++     * message is found (e.g. ReadyForQuery, ParseComplete), it indicates
++     * the connection's protocol stream is misaligned (corrupted) and an
++     * exception is thrown so the caller can discard the connection.
++     *
++     * Should be called after borrowing a connection from the pool.
++     */
++    @SuppressWarnings("unused")
++    public void drainAsyncMessages() {
++        try (final TryLock ignored = lock.get()) {
++            while (IOTool.available(inStream) > 0) {
++                final IServerMessage msg = readMessage(false);
++                if (msg instanceof NoticeResponse nr) {
++                    handleNoticeResponse(nr);
++                } else if (msg instanceof ParameterStatus ps) {
++                    handleParameterStatus(ps);
++                } else if (msg instanceof NotificationResponse notif) {
++                    handleNotificationResponse(notif);
++                } else {
++                    throw new PGError(
++                        "Protocol desync: unexpected message %s found in stream " +
++                        "during drain. Connection is corrupted and will be discarded.",
++                        msg
++                    );
++                }
++            }
++        }
++    }
++
+     @SuppressWarnings("unused")
+     public int pollNotifications() {
+         int count = 0;
+diff --git a/pg-core/src/java/org/pg/Pool.java b/pg-core/src/java/org/pg/Pool.java
+index 322662f..7133b79 100644
+--- a/pg-core/src/java/org/pg/Pool.java
++++ b/pg-core/src/java/org/pg/Pool.java
+@@ -102,6 +102,28 @@ public final class Pool implements AutoCloseable {
+         }
+     }
+ 
++    /**
++     * Validate a connection before handing it to a caller.
++     * Drains any pending async messages (NoticeResponse, ParameterStatus,
++     * NotificationResponse) that may have arrived while the connection
++     * sat idle in the pool. If non-async messages are found, the connection
++     * is corrupted and will be discarded.
++     *
++     * Returns true if the connection is healthy, false if it was discarded.
++     */
++    private boolean validateOnBorrow(final Connection conn) {
++        try {
++            conn.drainAsyncMessages();
++            return true;
++        } catch (Exception e) {
++            logger.log(System.Logger.Level.WARNING,
++                "Connection {0} failed validation on borrow (pool {1}): {2}",
++                conn.getId(), id, e.getMessage());
++            closeConnection(conn);
++            return false;
++        }
++    }
++
+     @SuppressWarnings("unused")
+     public Connection borrowConnection () {
+ 
+@@ -122,6 +144,9 @@ public final class Pool implements AutoCloseable {
+                     if (isExpired(conn)) {
+                         logger.log(System.Logger.Level.DEBUG, "Connection {0} has been expired, closing. Pool: {1}", conn.getId(),  this.id);
+                         closeConnection(conn);
++                    } else if (!validateOnBorrow(conn)) {
++                        // corrupted connection discarded, try next
++                        continue;
+                     } else {
+                         addUsed(conn);
+                         return conn;
+@@ -157,6 +182,11 @@ public final class Pool implements AutoCloseable {
+             );
+         }
+         else {
++            // Validate the waited-for connection too
++            if (!validateOnBorrow(conn)) {
++                // Discarded; try borrowing again (will spawn new or wait again)
++                return borrowConnection();
++            }
+             try (TryLock ignored = lock.get()) {
+                 addUsed(conn);
+                 return conn;
+@@ -259,6 +289,19 @@ public final class Pool implements AutoCloseable {
+             return;
+         }
+ 
++        // Check for protocol desync: unread data means the connection is corrupted.
++        // Discard it rather than poisoning the next borrower.
++        if (conn.hasUnreadData()) {
++            logger.log(System.Logger.Level.WARNING,
++                "Connection {0} has unread data in input stream on return, closing (pool {1})",
++                conn.getId(), id);
++            closeConnection(conn);
++            try (TryLock ignored = lock.get()) {
++                removeUsed(conn);
++            }
++            return;
++        }
++
+         // else
+         try (TryLock ignored = lock.get()) {
+             removeUsed(conn);
+diff --git a/pg-core/src/java/org/pg/PreparedStatement.java b/pg-core/src/java/org/pg/PreparedStatement.java
+index 3f8cd52..f69e5a0 100644
+--- a/pg-core/src/java/org/pg/PreparedStatement.java
++++ b/pg-core/src/java/org/pg/PreparedStatement.java
+@@ -17,8 +17,8 @@ public record PreparedStatement (
+         return String.format(
+                 "<Prepared statement, name: %s, param(s): %s, oids: %s, SQL: %s>",
+                 parse.statement(),
+-                parameterDescription.paramCount(),
+-                Arrays.toString(parameterDescription.oids()),
++                parameterDescription == null ? "null" : parameterDescription.paramCount(),
++                parameterDescription == null ? "null" : Arrays.toString(parameterDescription.oids()),
+                 parse.query()
+         );
+     }
