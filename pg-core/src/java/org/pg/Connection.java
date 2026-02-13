@@ -1558,6 +1558,42 @@ public final class Connection implements AutoCloseable {
         return IOTool.available(inStream) > 0;
     }
 
+    /**
+     * Drain any pending asynchronous messages from the input stream.
+     * PostgreSQL can send NoticeResponse, ParameterStatus, and
+     * NotificationResponse at any time, even when no query is active.
+     * These may accumulate in the TCP buffer while a connection sits
+     * idle in the pool.
+     *
+     * This method reads and handles those async messages. If a non-async
+     * message is found (e.g. ReadyForQuery, ParseComplete), it indicates
+     * the connection's protocol stream is misaligned (corrupted) and an
+     * exception is thrown so the caller can discard the connection.
+     *
+     * Should be called after borrowing a connection from the pool.
+     */
+    @SuppressWarnings("unused")
+    public void drainAsyncMessages() {
+        try (final TryLock ignored = lock.get()) {
+            while (IOTool.available(inStream) > 0) {
+                final IServerMessage msg = readMessage(false);
+                if (msg instanceof NoticeResponse nr) {
+                    handleNoticeResponse(nr);
+                } else if (msg instanceof ParameterStatus ps) {
+                    handleParameterStatus(ps);
+                } else if (msg instanceof NotificationResponse notif) {
+                    handleNotificationResponse(notif);
+                } else {
+                    throw new PGError(
+                        "Protocol desync: unexpected message %s found in stream " +
+                        "during drain. Connection is corrupted and will be discarded.",
+                        msg
+                    );
+                }
+            }
+        }
+    }
+
     @SuppressWarnings("unused")
     public int pollNotifications() {
         int count = 0;
