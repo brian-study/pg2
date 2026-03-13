@@ -548,6 +548,17 @@ public final class Connection implements AutoCloseable {
     private IServerMessage readMessage (final boolean skipMode) {
 
         final byte[] bufHeader = IOTool.readNBytes(inStream, 5);
+
+        if (bufHeader.length < 5) {
+            isClosed = true;
+            throw new PGError(
+                "Connection closed by server: expected 5 header bytes, got %d. " +
+                "This typically indicates the PostgreSQL server terminated the " +
+                "connection (idle timeout, server restart, or network interruption).",
+                bufHeader.length
+            );
+        }
+
         final ByteBuffer bbHeader = ByteBuffer.wrap(bufHeader);
 
         final char tag = (char) bbHeader.get();
@@ -565,6 +576,16 @@ public final class Connection implements AutoCloseable {
         }
 
         byte[] bufBody = IOTool.readNBytes(inStream, bodySize);
+
+        if (bufBody.length < bodySize) {
+            isClosed = true;
+            throw new PGError(
+                "Connection closed by server: expected %d body bytes for " +
+                "message '%c', got %d.",
+                bodySize, tag, bufBody.length
+            );
+        }
+
         ByteBuffer bbBody = ByteBuffer.wrap(bufBody);
 
         return switch (tag) {
