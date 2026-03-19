@@ -1,27 +1,35 @@
 
+## 0.1.47-SNAPSHOT
+
+- ?
+- ?
+- ?
+
+## 0.1.46-SNAPSHOT
+
+- ?
+- ?
+- ?
+
 ## 0.1.45-SNAPSHOT
 
 - ?
 - ?
 - ?
 
-## 0.1.44-SNAPSHOT
+## 0.1.44
 
-- ?
-- ?
-- ?
+- better readTypesProcess: query instead of copy
+- alter SQL_TYPE_COMMON query template
+- PGType from row map constructor
+- better notification polling: handle all messages
 
-## 0.1.43-SNAPSHOT
+## 0.1.43
 
-- ?
-- ?
-- ?
-
-## 0.1.41-SNAPSHOT
-
-- ?
-- ?
-- ?
+- add void processor (empty strings become nil)
+- when processing types, handle notices, notifications, parameters
+- handle notifications without passing result (use counter)
+- udpate tests
 
 ## 0.1.42
 

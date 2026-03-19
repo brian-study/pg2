@@ -1,0 +1,4 @@
+{:paths ["src"]
+
+ :deps {com.github.igrishaev/pg2-core {:local/root "../pg-core"}
+        com.github.seancorfield/honeysql {:mvn/version "2.4.1078"}}}

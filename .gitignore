@@ -17,6 +17,7 @@ package-lock.json
 package.json
 .idea
 .lein-failures
+.cpcache
 
 pg-bench/sample.csv
 pg-bench/foo.csv

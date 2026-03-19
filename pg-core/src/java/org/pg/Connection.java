@@ -224,51 +224,19 @@ public final class Connection implements AutoCloseable {
     Common logic for reading and parsing binary COPY payload.
      */
     private List<PGType> readTypesProcess(final String query) {
-        sendQuery(query);
-        flush();
-        IServerMessage msg;
         PGType pgType;
-        ByteBuffer bb;
-        boolean headerSeen = false;
-        final List<PGType> result = new ArrayList<>();
-        ErrorResponse errorResponse = null;
-        while (true) {
-            msg = readMessage(false);
+        final List<PGType> types = new ArrayList<>();
+        @SuppressWarnings("unchecked")
+        final List<RowMap> result = (List<RowMap>) query(query);
+        for (RowMap row: result) {
+            pgType = PGType.fromRowMap(row);
             if (Debug.isON) {
-                Debug.debug(" -> %s", msg);
+                Debug.debug(" -> %s\r\n", pgType);
             }
-            if (msg instanceof CopyData copyData) {
-                bb = copyData.buf();
-                if (!headerSeen) {
-                    BBTool.skip(bb, Copy.COPY_BIN_HEADER.length);
-                    headerSeen = true;
-                }
-                if (Copy.isTerminator(bb)) {
-                    continue;
-                }
-                pgType = PGType.fromCopyBuffer(bb);
-                if (Debug.isON) {
-                    Debug.debug(" -> %s\r\n", pgType);
-                }
-                result.add(pgType);
-            } else if (msg instanceof CopyOutResponse
-                    || msg instanceof CopyDone
-                    || msg instanceof CommandComplete) {
-                if (Debug.isON) {
-                    Debug.debug(" -> skipping message: %s", msg);
-                }
-            } else if (msg instanceof ReadyForQuery) {
-                break;
-            } else if (msg instanceof ErrorResponse e) {
-                errorResponse = e;
-            } else {
-                throw new PGError("Unexpected message in readTypes: %s", msg);
-            }
+            types.add(pgType);
+
         }
-        if (errorResponse != null) {
-            throw new PGErrorResponse(errorResponse);
-        }
-        return result;
+        return types;
     }
 
     @SuppressWarnings("unused")
@@ -518,10 +486,12 @@ public final class Connection implements AutoCloseable {
         return String.format("p%d", System.nanoTime());
     }
 
+    @SuppressWarnings("unused") // clojure
     public void setConfig(final String parameter, final String value, final boolean isLocal) {
         execute("select set_config($1, $2, $3)", List.of(parameter, value, isLocal));
     }
 
+    @SuppressWarnings("unused") // clojure
     public String currentSetting(final String parameter, final Boolean missingOk) {
         final Object result = execute("select current_setting($1, $2)", List.of(parameter, missingOk));
         return (String) CljAPI.nth.invoke(CljAPI.first.invoke(result), 0);
@@ -578,6 +548,17 @@ public final class Connection implements AutoCloseable {
     private IServerMessage readMessage (final boolean skipMode) {
 
         final byte[] bufHeader = IOTool.readNBytes(inStream, 5);
+
+        if (bufHeader.length < 5) {
+            isClosed = true;
+            throw new PGError(
+                "Connection closed by server: expected 5 header bytes, got %d. " +
+                "This typically indicates the PostgreSQL server terminated the " +
+                "connection (idle timeout, server restart, or network interruption).",
+                bufHeader.length
+            );
+        }
+
         final ByteBuffer bbHeader = ByteBuffer.wrap(bufHeader);
 
         final char tag = (char) bbHeader.get();
@@ -595,6 +576,16 @@ public final class Connection implements AutoCloseable {
         }
 
         byte[] bufBody = IOTool.readNBytes(inStream, bodySize);
+
+        if (bufBody.length < bodySize) {
+            isClosed = true;
+            throw new PGError(
+                "Connection closed by server: expected %d body bytes for " +
+                "message '%c', got %d.",
+                bodySize, tag, bufBody.length
+            );
+        }
+
         ByteBuffer bbBody = ByteBuffer.wrap(bufBody);
 
         return switch (tag) {
@@ -732,7 +723,17 @@ public final class Connection implements AutoCloseable {
                            final ExecuteParams executeParams
     ) {
         final List<Object> params = executeParams.params();
-        final int[] OIDs = stmt.parameterDescription().oids();
+        final ParameterDescription pd = stmt.parameterDescription();
+        if (pd == null) {
+            throw new PGError(
+                    "Protocol desync: parameterDescription is null in sendBind. " +
+                    "The server did not send a ParameterDescription during prepare. " +
+                    "This may indicate a corrupted connection or that an earlier query " +
+                    "left unread data in the input stream. SQL: %s, params: %s",
+                    stmt.parse().query(), params
+            );
+        }
+        final int[] OIDs = pd.oids();
         final int size = params.size();
 
         if (size != OIDs.length) {
@@ -972,7 +973,7 @@ public final class Connection implements AutoCloseable {
         if (msg instanceof final DataRow x) {
             handleDataRow(x, res);
         } else if (msg instanceof final NotificationResponse x) {
-            handleNotificationResponse(x, res);
+            handleNotificationResponse(x);
         } else if (msg instanceof AuthenticationCleartextPassword) {
             handleAuthenticationCleartextPassword();
         } else if (msg instanceof final AuthenticationSASL x) {
@@ -1275,8 +1276,7 @@ public final class Connection implements AutoCloseable {
         config.executor().execute(() -> f.invoke(arg));
     }
 
-    private void handleNotificationResponse (final NotificationResponse msg, final Result res) {
-        res.incNotificationCount();
+    private void handleNotificationResponse (final NotificationResponse msg) {
         // Sometimes, it's important to know whether a notification
         // was triggered by the current connection or another.
         final boolean isSelf = msg.pid() == pid;
@@ -1575,21 +1575,63 @@ public final class Connection implements AutoCloseable {
     }
 
     @SuppressWarnings("unused")
+    public boolean hasUnreadData() {
+        return IOTool.available(inStream) > 0;
+    }
+
+    /**
+     * Drain any pending asynchronous messages from the input stream.
+     * PostgreSQL can send NoticeResponse, ParameterStatus, and
+     * NotificationResponse at any time, even when no query is active.
+     * These may accumulate in the TCP buffer while a connection sits
+     * idle in the pool.
+     *
+     * This method reads and handles those async messages. If a non-async
+     * message is found (e.g. ReadyForQuery, ParseComplete), it indicates
+     * the connection's protocol stream is misaligned (corrupted) and an
+     * exception is thrown so the caller can discard the connection.
+     *
+     * Should be called after borrowing a connection from the pool.
+     */
+    @SuppressWarnings("unused")
+    public void drainAsyncMessages() {
+        try (final TryLock ignored = lock.get()) {
+            while (IOTool.available(inStream) > 0) {
+                final IServerMessage msg = readMessage(false);
+                if (msg instanceof NoticeResponse nr) {
+                    handleNoticeResponse(nr);
+                } else if (msg instanceof ParameterStatus ps) {
+                    handleParameterStatus(ps);
+                } else if (msg instanceof NotificationResponse notif) {
+                    handleNotificationResponse(notif);
+                } else {
+                    throw new PGError(
+                        "Protocol desync: unexpected message %s found in stream " +
+                        "during drain. Connection is corrupted and will be discarded.",
+                        msg
+                    );
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unused")
     public int pollNotifications() {
+        int count = 0;
         try (final TryLock ignored = lock.get()) {
             final Result res = new Result(ExecuteParams.INSTANCE, "--pollNotifications");
             while (IOTool.available(inStream) > 0) {
                 final IServerMessage msg = readMessage(res.hasException());
-                if (   msg instanceof NotificationResponse
-                    || msg instanceof NoticeResponse
-                    || msg instanceof ParameterStatus) {
-                    handleMessage(msg, res);
+                // count the amount of notifications handled
+                if (msg instanceof NotificationResponse nr) {
+                    count++;
+                    handleNotificationResponse(nr);
                 } else {
-                    throw new PGError("Unexpected message in pollNotifications: %s", msg);
+                    handleMessage(msg, res);
                 }
             }
             res.maybeThrowError();
-            return res.getNotificationCount();
+            return count;
         }
     }
 

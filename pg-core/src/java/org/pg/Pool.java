@@ -102,6 +102,28 @@ public final class Pool implements AutoCloseable {
         }
     }
 
+    /**
+     * Validate a connection before handing it to a caller.
+     * Drains any pending async messages (NoticeResponse, ParameterStatus,
+     * NotificationResponse) that may have arrived while the connection
+     * sat idle in the pool. If non-async messages are found, the connection
+     * is corrupted and will be discarded.
+     *
+     * Returns true if the connection is healthy, false if it was discarded.
+     */
+    private boolean validateOnBorrow(final Connection conn) {
+        try {
+            conn.drainAsyncMessages();
+            return true;
+        } catch (Exception e) {
+            logger.log(System.Logger.Level.WARNING,
+                "Connection {0} failed validation on borrow (pool {1}): {2}",
+                conn.getId(), id, e.getMessage());
+            closeConnection(conn);
+            return false;
+        }
+    }
+
     @SuppressWarnings("unused")
     public Connection borrowConnection () {
 
@@ -122,6 +144,9 @@ public final class Pool implements AutoCloseable {
                     if (isExpired(conn)) {
                         logger.log(System.Logger.Level.DEBUG, "Connection {0} has been expired, closing. Pool: {1}", conn.getId(),  this.id);
                         closeConnection(conn);
+                    } else if (!validateOnBorrow(conn)) {
+                        // corrupted connection discarded, try next
+                        continue;
                     } else {
                         addUsed(conn);
                         return conn;
@@ -157,6 +182,11 @@ public final class Pool implements AutoCloseable {
             );
         }
         else {
+            // Validate the waited-for connection too
+            if (!validateOnBorrow(conn)) {
+                // Discarded; try borrowing again (will spawn new or wait again)
+                return borrowConnection();
+            }
             try (TryLock ignored = lock.get()) {
                 addUsed(conn);
                 return conn;
@@ -252,6 +282,19 @@ public final class Pool implements AutoCloseable {
 
         // pool is closed
         if (this.isClosed()) {
+            closeConnection(conn);
+            try (TryLock ignored = lock.get()) {
+                removeUsed(conn);
+            }
+            return;
+        }
+
+        // Check for protocol desync: unread data means the connection is corrupted.
+        // Discard it rather than poisoning the next borrower.
+        if (conn.hasUnreadData()) {
+            logger.log(System.Logger.Level.WARNING,
+                "Connection {0} has unread data in input stream on return, closing (pool {1})",
+                conn.getId(), id);
             closeConnection(conn);
             try (TryLock ignored = lock.get()) {
                 removeUsed(conn);
